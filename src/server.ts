@@ -13,10 +13,13 @@ import {
 } from './config.js';
 import type { AgentToRelay, RelayToAgent } from './protocol.js';
 import {
-  createUser,
+  confirmPendingRegistration,
+  createPendingRegistration,
+  findPendingById,
   findUserByUsername,
   isAgentIdTaken,
   normalizeAgentId,
+  updateUserPassword,
   validateAgentId,
   listUsers,
 } from './userStore.js';
@@ -27,6 +30,7 @@ import {
   verifyPassword,
   verifyRelayToken,
 } from './auth.js';
+import { generateTotpSecret, totpAuthUrl, verifyTotpCode } from './totp.js';
 
 interface PendingHttp {
   resolve: (value: {
@@ -246,6 +250,7 @@ export function startRelayServer(): http.Server {
     });
   });
 
+  // Step 1: create pending registration + TOTP secret (account not active yet)
   app.post('/api/relay/register', async (req, res) => {
     const body = parseJsonBody(req);
     const agentName = String(body.agentName || body.agentId || '');
@@ -277,12 +282,52 @@ export function startRelayServer(): http.Server {
 
     try {
       const passwordHash = await hashPassword(password);
-      const user = createUser({
+      const totpSecret = generateTotpSecret();
+      const pending = createPendingRegistration({
         agentId,
         username,
         passwordHash,
+        totpSecret,
         label: agentName.trim() || agentId,
       });
+      log('info', `Pending register agent=${pending.agentId} user=${pending.username}`);
+      res.status(201).json({
+        success: true,
+        pendingId: pending.id,
+        agentId: pending.agentId,
+        username: pending.username,
+        totpSecret: pending.totpSecret,
+        otpauthUrl: totpAuthUrl(pending.totpSecret, pending.username),
+        totpRequired: true,
+        message:
+          'Authenticator uygulamasına ekleyin, 6 haneli kodu girip kaydı onaylayın.',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ success: false, error: msg });
+    }
+  });
+
+  // Step 2: confirm TOTP → activate user + return agentToken + JWT
+  app.post('/api/relay/register/confirm', async (req, res) => {
+    const body = parseJsonBody(req);
+    const pendingId = String(body.pendingId || '').trim();
+    const totpCode = String(body.totpCode || body.code || '').trim();
+    if (!pendingId) {
+      res.status(400).json({ success: false, error: 'pendingId gerekli' });
+      return;
+    }
+    const pending = findPendingById(pendingId);
+    if (!pending) {
+      res.status(400).json({ success: false, error: 'Kayıt oturumu süresi dolmuş; yeniden başlayın' });
+      return;
+    }
+    if (!verifyTotpCode(pending.totpSecret, totpCode, pending.username)) {
+      res.status(401).json({ success: false, error: 'Authenticator kodu hatalı' });
+      return;
+    }
+    try {
+      const user = confirmPendingRegistration(pendingId);
       const token = signRelayToken(user.username, user.agentId);
       log('info', `Registered agent=${user.agentId} user=${user.username}`);
       res.status(201).json({
@@ -292,7 +337,7 @@ export function startRelayServer(): http.Server {
         agentToken: user.agentToken,
         token,
         message:
-          'Kayıt tamam. PC bridge config.json → relay.agentId / relay.agentToken alanlarına agentToken yazın.',
+          'Kayıt tamam. PC bridge → relay.agentId / relay.agentToken yazın.',
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -300,16 +345,62 @@ export function startRelayServer(): http.Server {
     }
   });
 
-  // VDS login (routes user → their agent). Unknown users fall through to PC proxy.
+  // Password reset via authenticator (no email)
+  app.post('/api/relay/reset-password', async (req, res) => {
+    const body = parseJsonBody(req);
+    const username = String(body.username || '').trim();
+    const totpCode = String(body.totpCode || body.code || '').trim();
+    const newPassword = String(body.newPassword || body.password || '');
+    const user = findUserByUsername(username);
+    if (!user || !user.totpSecret) {
+      res.status(401).json({ success: false, error: 'Kullanıcı bulunamadı veya authenticator yok' });
+      return;
+    }
+    if (newPassword.length < 6) {
+      res.status(400).json({ success: false, error: 'Yeni şifre en az 6 karakter' });
+      return;
+    }
+    if (!verifyTotpCode(user.totpSecret, totpCode, user.username)) {
+      res.status(401).json({ success: false, error: 'Authenticator kodu hatalı' });
+      return;
+    }
+    const passwordHash = await hashPassword(newPassword);
+    updateUserPassword(user.username, passwordHash);
+    log('info', `Password reset user=${user.username}`);
+    res.json({ success: true, message: 'Şifre güncellendi; yeni şifre ile giriş yapın.' });
+  });
+
+  // VDS login — password + TOTP required for registered users
   app.post('/api/auth/login', async (req, res) => {
     const body = parseJsonBody(req);
     const username = String(body.username || '').trim();
     const password = String(body.password || '');
+    const totpCode = String(body.totpCode || body.code || '').trim();
     const user = findUserByUsername(username);
     if (user) {
       const ok = await verifyPassword(password, user.passwordHash);
       if (!ok) {
         res.status(401).json({ success: false, error: 'Kullanıcı adı veya şifre hatalı' });
+        return;
+      }
+      if (!user.totpSecret) {
+        res.status(403).json({
+          success: false,
+          error: 'Bu hesapta authenticator yok; yeniden kayıt olun',
+          totpRequired: true,
+        });
+        return;
+      }
+      if (!totpCode) {
+        res.status(401).json({
+          success: false,
+          error: 'Authenticator kodu gerekli',
+          totpRequired: true,
+        });
+        return;
+      }
+      if (!verifyTotpCode(user.totpSecret, totpCode, user.username)) {
+        res.status(401).json({ success: false, error: 'Authenticator kodu hatalı', totpRequired: true });
         return;
       }
       const token = signRelayToken(user.username, user.agentId);
@@ -523,7 +614,8 @@ export function startRelayServer(): http.Server {
     log('info', `Relay listening on :${config.port}`);
     log('info', `  Phone HTTP/WS: http://0.0.0.0:${config.port}/  and /ws`);
     log('info', `  Agent WS:      ws://0.0.0.0:${config.port}/agent`);
-    log('info', `  Registration:  POST /api/relay/register`);
+    log('info', `  Registration:  POST /api/relay/register (+ /confirm, TOTP)`);
+    log('info', `  Reset password: POST /api/relay/reset-password`);
     log('info', `  Default agent: ${config.defaultAgentId}`);
   });
 
