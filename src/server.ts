@@ -30,7 +30,7 @@ import {
   verifyPassword,
   verifyRelayToken,
 } from './auth.js';
-import { generateTotpSecret, totpAuthUrl, verifyTotpCode } from './totp.js';
+import { generateTotpSecret, totpAuthUrl, totpSecretForDisplay, verifyTotpCode } from './totp.js';
 
 interface PendingHttp {
   resolve: (value: {
@@ -296,11 +296,12 @@ export function startRelayServer(): http.Server {
         pendingId: pending.id,
         agentId: pending.agentId,
         username: pending.username,
-        totpSecret: pending.totpSecret,
+        // Base32 — Google Authenticator “kurulum anahtarı” alanına bunu yapıştır
+        totpSecret: totpSecretForDisplay(pending.totpSecret),
         otpauthUrl: totpAuthUrl(pending.totpSecret, pending.username),
         totpRequired: true,
         message:
-          'Authenticator uygulamasına ekleyin, 6 haneli kodu girip kaydı onaylayın.',
+          'Google Authenticator → Hesap ekle → Kurulum anahtarı gir. Anahtarı yapıştır (otpauth URL değil). Zaman tabanlı.',
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
