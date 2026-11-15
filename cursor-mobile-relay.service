@@ -1,0 +1,15 @@
+[Unit]
+Description=Cursor Mobile VDS Relay
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cursor-mobile/relay
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=3
+User=www-data
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

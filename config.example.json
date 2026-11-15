@@ -1,0 +1,12 @@
+{
+  "port": 8080,
+  "defaultAgentId": "default",
+  "agents": [
+    {
+      "id": "default",
+      "token": "CHANGE_ME_LONG_RANDOM_AGENT_TOKEN",
+      "label": "Murat PC"
+    }
+  ],
+  "httpProxyTimeoutMs": 60000
+}
