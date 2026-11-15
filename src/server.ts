@@ -346,6 +346,35 @@ export function startRelayServer(): http.Server {
     }
   });
 
+  // Re-show agentId + agentToken after username/password/TOTP (if setup dialog was closed)
+  app.post('/api/relay/reveal-agent', async (req, res) => {
+    const body = parseJsonBody(req);
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const totpCode = String(body.totpCode || body.code || '').trim();
+    const user = findUserByUsername(username);
+    if (!user) {
+      res.status(401).json({ success: false, error: 'Kullanıcı adı veya şifre hatalı' });
+      return;
+    }
+    const ok = await verifyPassword(password, user.passwordHash);
+    if (!ok) {
+      res.status(401).json({ success: false, error: 'Kullanıcı adı veya şifre hatalı' });
+      return;
+    }
+    if (!user.totpSecret || !verifyTotpCode(user.totpSecret, totpCode, user.username)) {
+      res.status(401).json({ success: false, error: 'Authenticator kodu hatalı', totpRequired: true });
+      return;
+    }
+    res.json({
+      success: true,
+      agentId: user.agentId,
+      agentToken: user.agentToken,
+      username: user.username,
+      message: 'PC Bridge Setup’a agentId ve agentToken yapıştır.',
+    });
+  });
+
   // Password reset via authenticator (no email)
   app.post('/api/relay/reset-password', async (req, res) => {
     const body = parseJsonBody(req);
