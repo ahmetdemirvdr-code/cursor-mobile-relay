@@ -1,5 +1,7 @@
 node_modules/
 dist/
+data/
 *.log
 config.json
 .env
+.deploy-agent-token.txt

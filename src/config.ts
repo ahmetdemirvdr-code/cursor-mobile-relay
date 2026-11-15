@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findUserByAgentId, findUserByAgentToken, listUsers } from './userStore.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = resolve(__dirname, '../config.json');
@@ -52,7 +53,6 @@ function fromEnv(): Partial<RelayConfig> | null {
 }
 
 export function loadRelayConfig(): RelayConfig {
-  // Coolify / Docker: prefer environment variables
   const envCfg = fromEnv();
   if (envCfg?.agents?.length) {
     return {
@@ -91,16 +91,38 @@ export function loadRelayConfig(): RelayConfig {
   };
 }
 
+/** Static config agents + self-registered users. */
+export function allKnownAgents(config: RelayConfig): RelayAgentConfig[] {
+  const map = new Map<string, RelayAgentConfig>();
+  for (const a of config.agents) map.set(a.id, a);
+  for (const u of listUsers()) {
+    map.set(u.agentId, { id: u.agentId, token: u.agentToken, label: u.label });
+  }
+  return [...map.values()];
+}
+
 export function findAgentByToken(
   config: RelayConfig,
   token: string
 ): RelayAgentConfig | undefined {
-  return config.agents.find((a) => a.token === token);
+  const fromConfig = config.agents.find((a) => a.token === token);
+  if (fromConfig) return fromConfig;
+  const user = findUserByAgentToken(token);
+  if (user) return { id: user.agentId, token: user.agentToken, label: user.label };
+  return undefined;
 }
 
 export function findAgentById(
   config: RelayConfig,
   id: string
 ): RelayAgentConfig | undefined {
-  return config.agents.find((a) => a.id === id);
+  const fromConfig = config.agents.find((a) => a.id === id);
+  if (fromConfig) return fromConfig;
+  const user = findUserByAgentId(id);
+  if (user) return { id: user.agentId, token: user.agentToken, label: user.label };
+  return undefined;
+}
+
+export function staticAgentIds(config: RelayConfig): string[] {
+  return config.agents.map((a) => a.id);
 }

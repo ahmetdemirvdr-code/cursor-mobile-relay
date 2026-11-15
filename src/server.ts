@@ -7,9 +7,26 @@ import {
   loadRelayConfig,
   findAgentByToken,
   findAgentById,
+  allKnownAgents,
+  staticAgentIds,
   type RelayConfig,
 } from './config.js';
 import type { AgentToRelay, RelayToAgent } from './protocol.js';
+import {
+  createUser,
+  findUserByUsername,
+  isAgentIdTaken,
+  normalizeAgentId,
+  validateAgentId,
+  listUsers,
+} from './userStore.js';
+import {
+  bearerToken,
+  hashPassword,
+  signRelayToken,
+  verifyPassword,
+  verifyRelayToken,
+} from './auth.js';
 
 interface PendingHttp {
   resolve: (value: {
@@ -23,6 +40,7 @@ interface PendingHttp {
 
 interface AgentSession {
   agentId: string;
+  agentToken: string;
   ws: WebSocket;
   pendingHttp: Map<string, PendingHttp>;
   phoneSessions: Map<string, WebSocket>;
@@ -42,7 +60,32 @@ function sendAgent(ws: WebSocket, msg: RelayToAgent): void {
   }
 }
 
-function pickAgentId(req: express.Request | IncomingMessage, config: RelayConfig): string {
+function parseJsonBody(req: express.Request): Record<string, unknown> {
+  const buf = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(typeof req.body === 'string' ? req.body : '');
+  if (!buf.length) return {};
+  try {
+    return JSON.parse(buf.toString('utf-8')) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function pickAgentId(
+  req: express.Request | IncomingMessage,
+  config: RelayConfig,
+  authHeader?: string
+): string {
+  const token = bearerToken(
+    authHeader ||
+      ('headers' in req ? (req.headers.authorization as string | undefined) : undefined)
+  );
+  if (token) {
+    const payload = verifyRelayToken(token);
+    if (payload?.agentId) return payload.agentId;
+  }
+
   const header =
     'headers' in req
       ? (req.headers['x-cursor-agent-id'] as string | undefined)
@@ -59,12 +102,86 @@ function pickAgentId(req: express.Request | IncomingMessage, config: RelayConfig
   return config.defaultAgentId;
 }
 
+async function proxyToAgent(
+  agents: Map<string, AgentSession>,
+  config: RelayConfig,
+  agentId: string,
+  req: express.Request,
+  res: express.Response
+): Promise<void> {
+  const session = agents.get(agentId);
+  if (!session) {
+    res.status(503).json({
+      success: false,
+      error: 'PC bağlı değil',
+      code: 'AGENT_OFFLINE',
+      agentId,
+    });
+    return;
+  }
+
+  const id = uuidv4();
+  const pathWithQuery = req.originalUrl || req.url;
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (v == null) continue;
+    if (k === 'host' || k === 'connection' || k === 'content-length') continue;
+    headers[k] = Array.isArray(v) ? v.join(', ') : v;
+  }
+  // PC accepts localhost proxy with this header (matches agent token)
+  headers['x-cursor-relay-proxy'] = session.agentToken;
+
+  const bodyBuf = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+  const resultPromise = new Promise<{
+    status: number;
+    headers: Record<string, string>;
+    body: Buffer;
+  }>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      session.pendingHttp.delete(id);
+      reject(new Error('Agent HTTP proxy timeout'));
+    }, config.httpProxyTimeoutMs);
+    session.pendingHttp.set(id, { resolve, reject, timer });
+  });
+
+  sendAgent(session.ws, {
+    type: 'http_proxy',
+    id,
+    method: req.method,
+    path: pathWithQuery,
+    headers,
+    bodyBase64: bodyBuf.length ? bodyBuf.toString('base64') : undefined,
+  });
+
+  try {
+    const result = await resultPromise;
+    for (const [k, v] of Object.entries(result.headers)) {
+      const lower = k.toLowerCase();
+      if (lower === 'transfer-encoding' || lower === 'connection' || lower === 'content-length') {
+        continue;
+      }
+      res.setHeader(k, v);
+    }
+    res.status(result.status).send(result.body);
+  } catch (err) {
+    log('warn', `HTTP proxy failed agent=${agentId}: ${err}`);
+    res.status(504).json({
+      success: false,
+      error: 'PC yanıt vermedi',
+      code: 'AGENT_TIMEOUT',
+      agentId,
+    });
+  }
+}
+
 export function startRelayServer(): http.Server {
   const config = loadRelayConfig();
   const agents = new Map<string, AgentSession>();
 
   const app = express();
-  // Capture raw body for proxy (JSON + other)
   app.use(
     express.raw({
       type: '*/*',
@@ -73,7 +190,7 @@ export function startRelayServer(): http.Server {
   );
 
   app.get('/', (_req, res) => {
-    const list = config.agents.map((a) => ({
+    const list = allKnownAgents(config).map((a) => ({
       id: a.id,
       label: a.label || a.id,
       connected: agents.has(a.id),
@@ -82,7 +199,7 @@ export function startRelayServer(): http.Server {
 <html><head><meta charset="utf-8"><title>Cursor Mobile Relay</title></head>
 <body style="font-family:sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem">
   <h1>Cursor Mobile Relay</h1>
-  <p>Telefon bu adrese bağlanır. PC bridge agent outbound bağlanır.</p>
+  <p>Kayıt / giriş telefonda. Her agent kendi PC'sine bağlanır.</p>
   <h2>Agent durumu</h2>
   <ul>
     ${list
@@ -102,81 +219,132 @@ export function startRelayServer(): http.Server {
     res.json({
       ok: true,
       defaultAgentId: config.defaultAgentId,
-      agents: config.agents.map((a) => ({
+      registration: true,
+      agents: allKnownAgents(config).map((a) => ({
         id: a.id,
         label: a.label || a.id,
         connected: agents.has(a.id),
       })),
+      registeredUsers: listUsers().length,
     });
   });
 
-  // Transparent API proxy → connected agent → localhost bridge
-  app.all('/api/*', async (req, res) => {
-    const agentId = pickAgentId(req, config);
-    const session = agents.get(agentId);
-    if (!session) {
-      res.status(503).json({
-        success: false,
-        error: 'PC bağlı değil',
-        code: 'AGENT_OFFLINE',
-        agentId,
-      });
+  // Live uniqueness check while typing
+  app.get('/api/relay/check-agent', (req, res) => {
+    const raw = String(req.query.name || '');
+    const agentId = normalizeAgentId(raw);
+    const formatError = validateAgentId(agentId);
+    if (formatError) {
+      res.json({ available: false, agentId, reason: formatError });
+      return;
+    }
+    const taken = isAgentIdTaken(agentId, staticAgentIds(config));
+    res.json({
+      available: !taken,
+      agentId,
+      reason: taken ? 'Bu agent adı alınmış' : null,
+    });
+  });
+
+  app.post('/api/relay/register', async (req, res) => {
+    const body = parseJsonBody(req);
+    const agentName = String(body.agentName || body.agentId || '');
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const agentId = normalizeAgentId(agentName);
+
+    const formatError = validateAgentId(agentId);
+    if (formatError) {
+      res.status(400).json({ success: false, error: formatError });
+      return;
+    }
+    if (username.length < 3) {
+      res.status(400).json({ success: false, error: 'Kullanıcı adı en az 3 karakter' });
+      return;
+    }
+    if (password.length < 6) {
+      res.status(400).json({ success: false, error: 'Şifre en az 6 karakter' });
+      return;
+    }
+    if (isAgentIdTaken(agentId, staticAgentIds(config))) {
+      res.status(409).json({ success: false, error: 'Bu agent adı alınmış' });
+      return;
+    }
+    if (findUserByUsername(username)) {
+      res.status(409).json({ success: false, error: 'Bu kullanıcı adı alınmış' });
       return;
     }
 
-    const id = uuidv4();
-    const pathWithQuery = req.originalUrl || req.url;
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (v == null) continue;
-      if (k === 'host' || k === 'connection' || k === 'content-length') continue;
-      headers[k] = Array.isArray(v) ? v.join(', ') : v;
-    }
-
-    const bodyBuf = Buffer.isBuffer(req.body)
-      ? req.body
-      : Buffer.from(typeof req.body === 'string' ? req.body : '');
-
-    const resultPromise = new Promise<{
-      status: number;
-      headers: Record<string, string>;
-      body: Buffer;
-    }>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        session.pendingHttp.delete(id);
-        reject(new Error('Agent HTTP proxy timeout'));
-      }, config.httpProxyTimeoutMs);
-      session.pendingHttp.set(id, { resolve, reject, timer });
-    });
-
-    sendAgent(session.ws, {
-      type: 'http_proxy',
-      id,
-      method: req.method,
-      path: pathWithQuery,
-      headers,
-      bodyBase64: bodyBuf.length ? bodyBuf.toString('base64') : undefined,
-    });
-
     try {
-      const result = await resultPromise;
-      for (const [k, v] of Object.entries(result.headers)) {
-        const lower = k.toLowerCase();
-        if (lower === 'transfer-encoding' || lower === 'connection' || lower === 'content-length') {
-          continue;
-        }
-        res.setHeader(k, v);
-      }
-      res.status(result.status).send(result.body);
-    } catch (err) {
-      log('warn', `HTTP proxy failed agent=${agentId}: ${err}`);
-      res.status(504).json({
-        success: false,
-        error: 'PC yanıt vermedi',
-        code: 'AGENT_TIMEOUT',
+      const passwordHash = await hashPassword(password);
+      const user = createUser({
         agentId,
+        username,
+        passwordHash,
+        label: agentName.trim() || agentId,
       });
+      const token = signRelayToken(user.username, user.agentId);
+      log('info', `Registered agent=${user.agentId} user=${user.username}`);
+      res.status(201).json({
+        success: true,
+        agentId: user.agentId,
+        username: user.username,
+        agentToken: user.agentToken,
+        token,
+        message:
+          'Kayıt tamam. PC bridge config.json → relay.agentId / relay.agentToken alanlarına agentToken yazın.',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ success: false, error: msg });
     }
+  });
+
+  // VDS login (routes user → their agent). Unknown users fall through to PC proxy.
+  app.post('/api/auth/login', async (req, res) => {
+    const body = parseJsonBody(req);
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const user = findUserByUsername(username);
+    if (user) {
+      const ok = await verifyPassword(password, user.passwordHash);
+      if (!ok) {
+        res.status(401).json({ success: false, error: 'Kullanıcı adı veya şifre hatalı' });
+        return;
+      }
+      const token = signRelayToken(user.username, user.agentId);
+      res.json({
+        success: true,
+        token,
+        username: user.username,
+        agentId: user.agentId,
+      });
+      return;
+    }
+    // Legacy / single-PC: proxy login to default (or header) agent
+    await proxyToAgent(agents, config, pickAgentId(req, config), req, res);
+  });
+
+  app.get('/api/auth/verify', (req, res) => {
+    const token = bearerToken(req.headers.authorization);
+    if (token) {
+      const payload = verifyRelayToken(token);
+      if (payload) {
+        res.json({
+          valid: true,
+          username: payload.username,
+          agentId: payload.agentId,
+        });
+        return;
+      }
+    }
+    void proxyToAgent(agents, config, pickAgentId(req, config), req, res);
+  });
+
+  // Transparent API proxy → user's agent (from JWT) or default
+  app.all('/api/*', async (req, res) => {
+    const agentId = pickAgentId(req, config);
+    await proxyToAgent(agents, config, agentId, req, res);
   });
 
   const server = http.createServer(app);
@@ -218,7 +386,6 @@ export function startRelayServer(): http.Server {
           ws.close(4001, 'auth failed');
           return;
         }
-        // Replace existing agent connection
         const prev = agents.get(cfg.id);
         if (prev && prev.ws !== ws) {
           try {
@@ -241,6 +408,7 @@ export function startRelayServer(): http.Server {
 
         authed = {
           agentId: cfg.id,
+          agentToken: cfg.token,
           ws,
           pendingHttp: new Map(),
           phoneSessions: new Map(),
@@ -304,7 +472,7 @@ export function startRelayServer(): http.Server {
   });
 
   wssPhone.on('connection', (ws, req) => {
-    const agentId = pickAgentId(req, config);
+    const agentId = pickAgentId(req, config, req.headers.authorization);
     if (!findAgentById(config, agentId)) {
       ws.close(4004, 'Unknown agent');
       return;
@@ -317,7 +485,7 @@ export function startRelayServer(): http.Server {
           id: uuidv4(),
           timestamp: Date.now(),
           code: 'AGENT_OFFLINE',
-          message: 'PC bağlı değil',
+          message: 'PC bağlı değil — bridge çalışıyor mu?',
         })
       );
       ws.close(1013, 'PC offline');
@@ -348,7 +516,6 @@ export function startRelayServer(): http.Server {
         current.phoneSessions.delete(sessionId);
         sendAgent(current.ws, { type: 'ws_close', sessionId });
       }
-      log('info', `Phone WS closed session=${sessionId.slice(0, 8)}…`);
     });
   });
 
@@ -356,6 +523,7 @@ export function startRelayServer(): http.Server {
     log('info', `Relay listening on :${config.port}`);
     log('info', `  Phone HTTP/WS: http://0.0.0.0:${config.port}/  and /ws`);
     log('info', `  Agent WS:      ws://0.0.0.0:${config.port}/agent`);
+    log('info', `  Registration:  POST /api/relay/register`);
     log('info', `  Default agent: ${config.defaultAgentId}`);
   });
 
